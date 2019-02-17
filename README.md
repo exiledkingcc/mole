@@ -1,2 +1,2 @@
 # mole
-mole proxy
+a simple proxy like shadowsocks
