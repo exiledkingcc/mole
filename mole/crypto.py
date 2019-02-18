@@ -5,7 +5,7 @@ import hashlib
 from mole.libsodium import LibSodium
 
 
-class DataLayer:
+class Crypto:
     prefix_len = 0
 
     def encrypt(self, data: bytes):
@@ -15,7 +15,7 @@ class DataLayer:
         raise NotImplemented
 
 
-class PlainLayer(DataLayer):
+class PlainCrypto(Crypto):
     def encrypt(self, data: bytes):
         return data
 
@@ -23,7 +23,7 @@ class PlainLayer(DataLayer):
         return data
 
 
-class MoleLayer(DataLayer):
+class MoleCrypto(Crypto):
     prefix_len = 4
 
     def __init__(self, key, nonce):

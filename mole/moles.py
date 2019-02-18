@@ -5,7 +5,7 @@ import enum
 import logging
 import socket
 
-from mole import layers
+from mole import crypto
 from mole import utils
 
 log = logging.getLogger(__name__)
@@ -35,7 +35,7 @@ class MoleClientProtocol(asyncio.Protocol):
     def __init__(self, loop, remote, layer, dev=False):
         self._loop = loop  # type: asyncio.AbstractEventLoop
         self._remote = remote[-1]
-        self._layer = layer  # type: layers.DataLayer
+        self._layer = layer  # type: crypto.Crypto
         self._dev = dev
 
         self._socket = socket.socket(remote[0], remote[1], remote[2])
@@ -73,6 +73,8 @@ class MoleClientProtocol(asyncio.Protocol):
             asyncio.ensure_future(self._handle_connect(data))
         elif self._state == Socks5State.Stream:
             self._tx_data += self._layer.encrypt(data)
+        elif self._state == Socks5State.Done:
+            self._transport.close()
 
     async def _handle_ver(self, data: bytes):
         if data[0] == 5 or data[0] == 4:
@@ -171,7 +173,7 @@ class MoleClientProtocol(asyncio.Protocol):
 class MoleServerProtocol(asyncio.Protocol):
     def __init__(self, loop, layer, dev=False):
         self._loop = loop  # type: asyncio.AbstractEventLoop
-        self._layer = layer  # type: layers.DataLayer
+        self._layer = layer  # type: crypto.Crypto
         self._dev = dev
 
         self._socket = None  # type: socket.socket
@@ -194,13 +196,14 @@ class MoleServerProtocol(asyncio.Protocol):
         # noinspection PyBroadException
         try:
             self._loop.remove_reader(self._socket)
-            self._loop.remove_writer(self._socket)
+            # self._loop.remove_writer(self._socket)
             self._socket.close()
         except Exception:
             pass
 
     def data_received(self, data: bytes):
         if self._state != Socks5State.Connect and self._state != Socks5State.Stream:
+            self._transport.close()
             return
 
         self._rx_data += data
@@ -248,6 +251,15 @@ class MoleServerProtocol(asyncio.Protocol):
                 self._state = Socks5State.Done
         else:
             self._tx_data += data
+            try:
+                sent = self._socket.send(self._tx_data, socket.SOCK_NONBLOCK)
+                self._tx_data = self._tx_data[sent:]
+            except BrokenPipeError:
+                log.error("BrokenPipeError send %s", self._target)
+                self._socket.close()
+                self._state = Socks5State.Done
+            except Exception as e:
+                log.error("", exc_info=e)
 
         return True
 
@@ -256,27 +268,12 @@ class MoleServerProtocol(asyncio.Protocol):
         info = info[0]
         self._socket = socket.socket(info[0], info[1], info[2])
         self._socket.setblocking(False)
+        self._socket.settimeout(5)
         await self._loop.sock_connect(self._socket, info[-1])
         self._loop.add_reader(self._socket, self._recv)
-        self._loop.add_writer(self._socket, self._send)
         reply = b"\x00\x00\x00\x00"
         reply = self._layer.encrypt(reply)
         self._transport.write(reply)
-
-    def _send(self):
-        if not self._tx_data:
-            return
-        if not self._socket or self._socket.fileno() < 0:
-            return
-        try:
-            sent = self._socket.send(self._tx_data, socket.SOCK_NONBLOCK)
-            self._tx_data = self._tx_data[sent:]
-        except BrokenPipeError:
-            log.error("BrokenPipeError send %s", self._target)
-            self._socket.close()
-            self._state = Socks5State.Done
-        except Exception as e:
-            log.error("", exc_info=e)
 
     def _recv(self):
         if not self._socket or self._socket.fileno() < 0:

@@ -8,7 +8,7 @@ import socket
 import sys
 import traceback
 
-from mole import layers
+from mole import crypto
 from mole.moles import MoleClientProtocol, MoleServerProtocol
 
 
@@ -60,7 +60,7 @@ def main(args=None):
     parser.add_argument("mode", help="run mode", choices=["client", "server", "proxy"])
     args = parser.parse_args(args=args)
 
-    layer = layers.MoleLayer("hello", "world")
+    layer = crypto.MoleCrypto("hello", "world")
 
     if args.mode == "client":
         return client(layer, args.port, args.remote, args.dev)
