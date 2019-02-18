@@ -63,7 +63,7 @@ class MoleClientProtocol(asyncio.Protocol):
             self._loop.remove_reader(self._socket)
             self._loop.remove_writer(self._socket)
             self._socket.close()
-        except:
+        except Exception:
             pass
 
     def data_received(self, data: bytes):
@@ -196,7 +196,7 @@ class MoleServerProtocol(asyncio.Protocol):
             self._loop.remove_reader(self._socket)
             self._loop.remove_writer(self._socket)
             self._socket.close()
-        except:
+        except Exception:
             pass
 
     def data_received(self, data: bytes):

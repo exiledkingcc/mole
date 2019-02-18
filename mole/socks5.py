@@ -41,20 +41,27 @@ class Socks5Protocol(asyncio.Protocol):
 
         self._socket = None  # type: socket.socket
         self._transport = None
-        self._peer_name = None
-        self._target_name = None
+        self._peer = None
+        self._target = None
         self._con_data = None  # type: bytes
         self._state = None  # type: Socks5State
         self._tx_data = b""
 
     def connection_made(self, transport):
         self._transport = transport
-        self._peer_name = self._transport.get_extra_info('peername')
-        log.info("<<== %s", self._peer_name)
+        self._peer = self._transport.get_extra_info('peername')
+        log.info("<<== %s", self._peer)
         self._state = Socks5State.Ver
 
     def connection_lost(self, exc):
-        log.info("%s ==>", self._peer_name)
+        log.info("%s ==>", self._peer)
+        # noinspection PyBroadException
+        try:
+            self._loop.remove_reader(self._socket)
+            self._loop.remove_writer(self._socket)
+            self._socket.close()
+        except Exception:
+            pass
 
     def data_received(self, data: bytes):
         if self._state == Socks5State.Ver:
@@ -97,12 +104,12 @@ class Socks5Protocol(asyncio.Protocol):
             return
 
         port = utils.port_b2i(port)
-        self._target_name = (host, port)
+        self._target = (host, port)
         # noinspection PyBroadException
         try:
             await self._connect_target(host, port)
         except Exception:
-            log.error("connect_target %s", self._target_name)
+            log.error("connect_target %s", self._target)
             self._transport.write(b"\x05\x01")
             self._state = Socks5State
         return True
@@ -128,7 +135,7 @@ class Socks5Protocol(asyncio.Protocol):
             sent = self._socket.send(self._tx_data, socket.SOCK_NONBLOCK)
             self._tx_data = self._tx_data[sent:]
         except BrokenPipeError:
-            log.error("BrokenPipeError send %s", self._target_name)
+            log.error("BrokenPipeError send %s", self._target)
             self._socket.close()
             self._state = Socks5State.Done
         except Exception as e:
@@ -142,7 +149,7 @@ class Socks5Protocol(asyncio.Protocol):
             if data:
                 self._transport.write(data)
         except BrokenPipeError:
-            log.error("BrokenPipeError recv %s", self._target_name)
+            log.error("BrokenPipeError recv %s", self._target)
             self._socket.close()
             self._state = Socks5State.Done
         except Exception as e:
