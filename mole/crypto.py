@@ -31,17 +31,17 @@ class MoleCrypto(Crypto):
         self._key = key[:LibSodium.xchacha20poly1305_ietf_keybytes]
         self._nonce = nonce.encode("utf-8")
 
-    def encrypt(self, data: bytes):
+    def encrypt(self, data: bytearray):
         nonce = LibSodium.randombytes(4)
         nonce2 = hashlib.sha512(self._nonce + nonce).digest()[:LibSodium.xchacha20poly1305_ietf_npubbytes]
-        e = LibSodium.xchacha20poly1305_ietf_encrypt(data, nonce2, self._key)
+        e = LibSodium.xchacha20poly1305_ietf_encrypt(bytes(data), nonce2, self._key)
         e = nonce + e
         el = len(e).to_bytes(self.prefix_len, "little")
         return el + e
 
-    def decrypt(self, data: bytes):
+    def decrypt(self, data: bytearray):
         nonce = data[:4]
         nonce2 = hashlib.sha512(self._nonce + nonce).digest()[:LibSodium.xchacha20poly1305_ietf_npubbytes]
         ciphertext = data[4:]
-        m = LibSodium.xchacha20poly1305_ietf_decrypt(ciphertext, nonce2, self._key)
+        m = LibSodium.xchacha20poly1305_ietf_decrypt(bytes(ciphertext), nonce2, self._key)
         return m

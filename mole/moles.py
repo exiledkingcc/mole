@@ -31,261 +31,364 @@ class Socks5State(enum.IntEnum):
     Done = 4
 
 
-class MoleClientProtocol(asyncio.Protocol):
-    def __init__(self, loop, remote, layer, dev=False):
-        self._loop = loop  # type: asyncio.AbstractEventLoop
-        self._remote = remote[-1]
-        self._layer = layer  # type: crypto.Crypto
-        self._dev = dev
+def host_name(addr: bytes, atype):
+    if atype == Socks5IpTYpe.IPV4.value:
+        return utils.host_v4(atype)
+    elif atype == Socks5IpTYpe.IPV6.value:
+        return utils.host_v6(addr)
+    elif atype == Socks5IpTYpe.Domain.value:
+        return addr[1:].decode("utf-8")
+    return None
 
-        self._socket = socket.socket(remote[0], remote[1], remote[2])
+
+class MoleClient:
+    def __init__(self, port, remote, _crypto):
+        self._port = port
+        self._crypto = _crypto  # type: crypto.Crypto
+
+        self._loop = asyncio.get_event_loop()
+        self._remote = None
+        asyncio.ensure_future(self._get_remote_info(remote))
+
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._socket.setblocking(False)
-        self._transport = None
-        self._peer = None
-        self._target = None
-        self._con_data = None  # type: bytes
-        self._state = None  # type: Socks5State
-        self._tx_data = b""
-        self._rx_data = b""
+        self._socket.bind(("0.0.0.0", self._port))
+        self._socket.listen(100)
+        log.info("listening at 0.0.0.0:%s", self._port)
 
-    def connection_made(self, transport):
-        self._transport = transport
-        self._peer = self._transport.get_extra_info('peername')
-        log.info("<<== %s", self._peer)
-        self._state = Socks5State.Ver
+    def __del__(self):
+        self._socket.close()
 
-        asyncio.ensure_future(self._connect_remote())
+    async def _get_remote_info(self, remote):
+        info = await self._loop.getaddrinfo(remote[0], remote[1])
+        self._remote = info[0]
 
-    def connection_lost(self, exc):
-        log.info("%s ==>", self._peer)
-        # noinspection PyBroadException
+    def start(self):
+        log.info("start...")
         try:
-            self._loop.remove_reader(self._socket)
-            self._loop.remove_writer(self._socket)
+            self._loop.run_until_complete(self.serve())
+        except KeyboardInterrupt:
             self._socket.close()
-        except Exception:
-            pass
 
-    def data_received(self, data: bytes):
-        if self._state == Socks5State.Ver:
-            asyncio.ensure_future(self._handle_ver(data))
-        elif self._state == Socks5State.Auth:
-            asyncio.ensure_future(self._handle_connect(data))
-        elif self._state == Socks5State.Stream:
-            self._tx_data += self._layer.encrypt(data)
-        elif self._state == Socks5State.Done:
-            self._transport.close()
+    def _decrypt(self, data):
+        PL = self._crypto.prefix_len
+        dlen = len(data)
+        if dlen <= PL + 4:
+            return 0, b""
+        xlen = int.from_bytes(data[:PL], "little")
+        if dlen < PL + xlen:
+            return 0, b""
 
-    async def _handle_ver(self, data: bytes):
-        if data[0] == 5 or data[0] == 4:
-            self._transport.write(b"\x05\x00")
-            self._state = Socks5State.Auth
-            return True
-        else:
-            log.warning("Unsupported version %s", data[0])
-            self._transport.write(b"\x05\x01")
-            self._state = Socks5State.Done
+        dd = data[PL: PL + xlen]
+        dd = self._crypto.decrypt(dd)
+        return PL + xlen, dd
 
-    async def _handle_connect(self, data: bytes):
+    async def serve(self):
+        while True:
+            sk, addr = await self._loop.sock_accept(self._socket)
+            log.info("<== %s", addr)
+            sk.setblocking(False)
+            self._loop.create_task(self.handle(sk))
+
+    async def handle(self, sk: socket.socket):
+        if not await self._handle_ver(sk):
+            return
+        rr = await self._handle_cmd(sk)
+        if not rr:
+            return
+        con_data, target = rr
+
+        log.info("connect to %s:%s", target[0], target[1])
+        sk2 = socket.socket(self._remote[0], self._remote[1], self._remote[2])
+        try:
+            sk2, ok = await self._handle_connect(sk2, con_data)
+        except Exception as e:
+            log.error("", exc_info=e)
+            ok = False
+
+        if not ok:
+            log.error("connecting %s:%s", target[0], target[1])
+            await self._loop.sock_sendall(sk, b"\x05\x01\x00" + con_data)
+            sk.close()
+            sk2.close()
+            return
+
+        await self._loop.sock_sendall(sk, b"\x05\x00\x00" + con_data)
+        log.info("connected with %s:%s", target[0], target[1])
+
+        N = 4096
+        tx_data = bytearray()
+        rx_data = bytearray()
+        dx_data = bytearray()
+        while True:
+            try:
+                tx = sk.recv(N, socket.MSG_DONTWAIT)
+                if tx:
+                    tx = self._crypto.encrypt(tx)
+                    tx_data.extend(tx)
+            except BlockingIOError:
+                await asyncio.sleep(0.1)
+            except ConnectionResetError:
+                log.warning("ConnectionResetError sk.recv %s:%s", target[0], target[1])
+                break
+            except BrokenPipeError:
+                log.warning("BrokenPipeError sk.recv %s:%s", target[0], target[1])
+                break
+
+            if tx_data:
+                sent = sk2.send(tx_data, socket.MSG_DONTWAIT)
+                del tx_data[:sent]
+
+            try:
+                rx = sk2.recv(N, socket.MSG_DONTWAIT)
+                if rx:
+                    rx_data.extend(rx)
+            except BlockingIOError:
+                await asyncio.sleep(0.1)
+            except ConnectionResetError:
+                log.warning("ConnectionResetError sk2.recv %s:%s", target[0], target[1])
+                break
+            except BrokenPipeError:
+                log.warning("BrokenPipeError sk2.recv %s:%s", target[0], target[1])
+                break
+
+            if rx_data:
+                dc, dd = self._decrypt(rx_data)
+                if dc > 0:
+                    del rx_data[:dc]
+                    dx_data.extend(dd)
+
+            if dx_data:
+                try:
+                    sent = sk.send(dx_data, socket.MSG_DONTWAIT)
+                    del dx_data[:sent]
+                except ConnectionResetError:
+                    log.warning("ConnectionResetError sk.send %s:%s", target[0], target[1])
+                    break
+                except BrokenPipeError:
+                    log.warning("BrokenPipeError sk.send %s:%s", target[0], target[1])
+                    break
+
+            await asyncio.sleep(0)
+
+        log.info("connect done with %s:%s", target[0], target[1])
+        sk.close()
+        sk2.close()
+
+    async def _handle_ver(self, sk: socket.socket):
+        data = await self._loop.sock_recv(sk, 1024)
+        while not data:
+            await asyncio.sleep(0)
+            data = await self._loop.sock_recv(sk, 1024)
+
+        if data[0] != 5:
+            log.warning("unsupported version: %s", data[0])
+            await self._loop.sock_sendall(sk, b"\x05\x00")
+            sk.close()
+            return False
+
+        await self._loop.sock_sendall(sk, b"\x05\x00")
+        return True
+
+    async def _handle_cmd(self, sk: socket.socket):
+        data = await self._loop.sock_recv(sk, 2048)
+        while not data:
+            await asyncio.sleep(0)
+            data = await self._loop.sock_recv(sk, 1024)
+
         cmd = data[1]
+        con_data = data[3:]
         if cmd != Socks5Cmd.Connect.value:
             log.error("unsupported cmd: %d", cmd)
-            self._transport.write(b"\x05\x01")
-            self._state = Socks5State.Done
+            await self._loop.sock_sendall(sk, b"\x05\x01\x00" + con_data)
+            sk.close()
             return
 
         atype = data[3]
-        addr = data[4:-2]
-        port = data[-2:]
-        self._con_data = data
-        if atype not in (Socks5IpTYpe.IPV4.value, Socks5IpTYpe.IPV6.value, Socks5IpTYpe.Domain.value):
-            log.error("unsupported atype: %d", atype)
-            self._transport.write(b"\x05\x01")
-            self._state = Socks5State.Done
-            return
+        host = host_name(data[4:-2], atype)
+        port = utils.port_b2i(data[-2:])
+        target = (host, port)
+        return con_data, target
 
-        data = data[3:4] + port + addr
-        self._target = (addr, port)
-        self._state = Socks5State.Connect
-        self._tx_data += self._layer.encrypt(data)
-        return True
-
-    async def _connect_remote(self):
-        await self._loop.sock_connect(self._socket, self._remote)
-        self._loop.add_reader(self._socket, self._recv)
-        self._loop.add_writer(self._socket, self._send)
-
-    def _send(self):
-        if not self._tx_data:
-            return
-        if not self._socket or self._socket.fileno() < 0:
-            return
-        try:
-            sent = self._socket.send(self._tx_data, socket.SOCK_NONBLOCK)
-            self._tx_data = self._tx_data[sent:]
-        except BrokenPipeError:
-            log.error("BrokenPipeError send %s", self._remote)
-            self._socket.close()
-            self._state = Socks5State.Done
-        except Exception as e:
-            log.error("", exc_info=e)
-
-    def _recv(self):
-        if not self._socket or self._socket.fileno() < 0:
-            return
-        try:
-            data = self._socket.recv(2048, socket.SOCK_NONBLOCK)
-            if not data:
-                return
-            self._rx_data += data
-            rx_len = len(self._rx_data)
-            pl = self._layer.prefix_len
-            if rx_len < pl:
-                return
-            xlen = int.from_bytes(self._rx_data[:pl], "little")
-            if rx_len < pl + xlen:
-                return
-            rx_data = self._rx_data[pl:pl + xlen]
-            self._rx_data = self._rx_data[pl + xlen:]
-
-            rx_data = self._layer.decrypt(rx_data)
-            if self._state == Socks5State.Connect:
-                if rx_data[0] == 0:
-                    log.info("connect target %s", self._target)
-                    self._transport.write(b"\x05\x00" + self._con_data[2:])
-                    self._state = Socks5State.Stream
-                else:
-                    log.error("connect target %s", self._target)
-                    self._transport.write(b"\x05\x01" + self._con_data[2:])
-                    self._state = Socks5State.Done
-            elif self._state == Socks5State.Stream:
-                self._transport.write(rx_data)
-            else:
-                log.error("error state %s", self._state)
-        except BrokenPipeError:
-            log.error("BrokenPipeError recv %s", self._remote)
-            self._socket.close()
-            self._state = Socks5State.Done
-        except Exception as e:
-            log.error("", exc_info=e)
+    async def _handle_connect(self, sk2, con_data):
+        log.info("connect to remote")
+        sk2.setblocking(False)
+        await self._loop.sock_connect(sk2, self._remote[-1])
+        data = self._crypto.encrypt(con_data)
+        await self._loop.sock_sendall(sk2, data)
+        rr = await self._loop.sock_recv(sk2, 1024)
+        rr = self._crypto.decrypt(rr[self._crypto.prefix_len:])
+        return sk2, rr[0] == 0
 
 
-class MoleServerProtocol(asyncio.Protocol):
-    def __init__(self, loop, layer, dev=False):
-        self._loop = loop  # type: asyncio.AbstractEventLoop
-        self._layer = layer  # type: crypto.Crypto
-        self._dev = dev
+class MoleServer:
+    def __init__(self, port,  _crypto):
+        self._port = port
+        self._crypto = _crypto  # type: crypto.Crypto
 
-        self._socket = None  # type: socket.socket
-        self._transport = None
-        self._peer = None
-        self._target = None
-        self._con_data = None  # type: bytes
-        self._state = None  # type: Socks5State
-        self._tx_data = b""
-        self._rx_data = b""
+        self._loop = asyncio.get_event_loop()
 
-    def connection_made(self, transport):
-        self._transport = transport
-        self._peer = self._transport.get_extra_info('peername')
-        log.info("<<== %s", self._peer)
-        self._state = Socks5State.Connect
-
-    def connection_lost(self, exc):
-        log.info("%s ==>", self._peer)
-        # noinspection PyBroadException
-        try:
-            self._loop.remove_reader(self._socket)
-            # self._loop.remove_writer(self._socket)
-            self._socket.close()
-        except Exception:
-            pass
-
-    def data_received(self, data: bytes):
-        if self._state != Socks5State.Connect and self._state != Socks5State.Stream:
-            self._transport.close()
-            return
-
-        self._rx_data += data
-        rx_len = len(self._rx_data)
-        pl = self._layer.prefix_len
-        if rx_len < pl:
-            return
-        xlen = int.from_bytes(self._rx_data[:pl], "little")
-        if rx_len < pl + xlen:
-            return
-        rx_data = self._rx_data[pl:pl + xlen]
-        self._rx_data = self._rx_data[pl + xlen:]
-
-        try:
-            rx_data = self._layer.decrypt(rx_data)
-        except ValueError:
-            log.error("decrypt error!")
-            self._state = Socks5State.Done
-            self._transport.close()
-
-        asyncio.ensure_future(self._handle_data(rx_data))
-
-    async def _handle_data(self, data: bytes):
-        if self._state == Socks5State.Connect:
-            atype = data[0]
-            port = data[1:3]
-            addr = data[3:]
-            if atype == Socks5IpTYpe.IPV4.value or atype == Socks5IpTYpe.IPV6.value:
-                host = addr.decode("ascii")
-            else:
-                host = addr[1:].decode("utf-8")
-            port = utils.port_b2i(port)
-            self._target = (host, port)
-            # noinspection PyBroadException
-            try:
-                log.info("connect to %s:%d", host, port)
-                await self._connect_target(host, port)
-                log.info("connected %s:%d ok", host, port)
-                self._state = Socks5State.Stream
-            except Exception:
-                log.error("connect_target %s", self._target)
-                reply = b"\x01\x00\x00\x00"
-                reply = self._layer.encrypt(reply)
-                self._transport.write(reply)
-                self._state = Socks5State.Done
-        else:
-            self._tx_data += data
-            try:
-                sent = self._socket.send(self._tx_data, socket.SOCK_NONBLOCK)
-                self._tx_data = self._tx_data[sent:]
-            except BrokenPipeError:
-                log.error("BrokenPipeError send %s", self._target)
-                self._socket.close()
-                self._state = Socks5State.Done
-            except Exception as e:
-                log.error("", exc_info=e)
-
-        return True
-
-    async def _connect_target(self, host, port):
-        info = await self._loop.getaddrinfo(host, port)
-        info = info[0]
-        self._socket = socket.socket(info[0], info[1], info[2])
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._socket.setblocking(False)
-        self._socket.settimeout(5)
-        await self._loop.sock_connect(self._socket, info[-1])
-        self._loop.add_reader(self._socket, self._recv)
-        reply = b"\x00\x00\x00\x00"
-        reply = self._layer.encrypt(reply)
-        self._transport.write(reply)
+        self._socket.bind(("0.0.0.0", self._port))
+        self._socket.listen(100)
+        log.info("listening at 0.0.0.0:%s", self._port)
 
-    def _recv(self):
-        if not self._socket or self._socket.fileno() < 0:
-            return
+    def __del__(self):
+        self._socket.close()
+
+    def start(self):
+        log.info("start...")
         try:
-            data = self._socket.recv(2048, socket.SOCK_NONBLOCK)
-            if data:
-                data = self._layer.encrypt(data)
-                self._transport.write(data)
-        except BrokenPipeError:
-            log.error("BrokenPipeError recv %s", self._target)
+            self._loop.run_until_complete(self.serve())
+        except KeyboardInterrupt:
             self._socket.close()
-            self._state = Socks5State.Done
+
+    def _decrypt(self, data):
+        PL = self._crypto.prefix_len
+        dlen = len(data)
+        if dlen <= PL + 4:
+            return 0, b""
+        xlen = int.from_bytes(data[:PL], "little")
+        if dlen < PL + xlen:
+            return 0, b""
+
+        dd = data[PL: PL + xlen]
+        dd = self._crypto.decrypt(dd)
+        return PL + xlen, dd
+
+    async def serve(self):
+        while True:
+            sk, addr = await self._loop.sock_accept(self._socket)
+            log.info("<== %s", addr)
+            sk.setblocking(False)
+            self._loop.create_task(self.handle(sk))
+
+    async def handle(self, sk: socket.socket):
+        sk2, target = await self._handle_connect(sk)
+        if not sk2:
+            log.error("connecting %s:%s", target[0], target[1])
+            data = self._crypto.encrypt(b"\x01\x01")
+            await self._loop.sock_sendall(sk, data)
+            sk.close()
+            return
+
+        log.info("connected with %s:%s", target[0], target[1])
+        data = self._crypto.encrypt(b"\x00\x00")
+        await self._loop.sock_sendall(sk, data)
+
+        N = 4096
+        tx_data = bytearray()
+        rx_data = bytearray()
+        dx_data = bytearray()
+        while True:
+            try:
+                tx = sk.recv(N, socket.MSG_DONTWAIT)
+                if tx:
+                    tx_data.extend(tx)
+            except BlockingIOError:
+                await asyncio.sleep(0.1)
+            except ConnectionResetError:
+                log.warning("ConnectionResetError sk.recv %s:%s", target[0], target[1])
+                break
+            except BrokenPipeError:
+                log.warning("BrokenPipeError sk.recv %s:%s", target[0], target[1])
+                break
+
+            if tx_data:
+                dc, dd = self._decrypt(tx_data)
+                if dc > 0:
+                    del tx_data[:dc]
+                    dx_data.extend(dd)
+
+            if dx_data:
+                sent = sk2.send(dx_data, socket.MSG_DONTWAIT)
+                del dx_data[:sent]
+
+            try:
+                rx = sk2.recv(N, socket.MSG_DONTWAIT)
+                if rx:
+                    rx = self._crypto.encrypt(rx)
+                    rx_data.extend(rx)
+            except BlockingIOError:
+                await asyncio.sleep(0.1)
+            except ConnectionResetError:
+                log.warning("ConnectionResetError sk2.recv %s:%s", target[0], target[1])
+                break
+            except BrokenPipeError:
+                log.warning("BrokenPipeError sk2.recv %s:%s", target[0], target[1])
+                break
+
+            if rx_data:
+                try:
+                    sent = sk.send(rx_data, socket.MSG_DONTWAIT)
+                    del rx_data[:sent]
+                except ConnectionResetError:
+                    log.warning("ConnectionResetError sk.send %s:%s", target[0], target[1])
+                    break
+                except BrokenPipeError:
+                    log.warning("BrokenPipeError sk.send %s:%s", target[0], target[1])
+                    break
+
+            await asyncio.sleep(0)
+
+        log.info("connect done with %s:%s", target[0], target[1])
+        sk.close()
+        sk2.close()
+
+    async def _handle_ver(self, sk: socket.socket):
+        data = await self._loop.sock_recv(sk, 256)
+        if data[0] != 5:
+            log.warning("unsupported version: %s", data[0])
+            await self._loop.sock_sendall(sk, b"\x05\x00")
+            sk.close()
+            return False
+
+        await self._loop.sock_sendall(sk, b"\x05\x00")
+        return True
+
+    async def _handle_cmd(self, sk: socket.socket):
+        data = await self._loop.sock_recv(sk, 2048)
+        cmd = data[1]
+        con_data = data[3:]
+        if cmd != Socks5Cmd.Connect.value:
+            log.error("unsupported cmd: %d", cmd)
+            await self._loop.sock_sendall(sk, b"\x05\x01\x00" + con_data)
+            sk.close()
+            return
+
+        atype = data[3]
+        host = host_name(data[4:-2], atype)
+        port = utils.port_b2i(data[-2:])
+        target = (host, port)
+        return con_data, target
+
+    async def _handle_connect(self, sk: socket.socket):
+        data = await self._loop.sock_recv(sk, 2048)
+        data = self._crypto.decrypt(data[self._crypto.prefix_len:])
+
+        atype = data[0]
+        host = host_name(data[1:-2], atype)
+        port = utils.port_b2i(data[-2:])
+        target = (host, port)
+        log.info("connect to %s:%s", host, port)
+        try:
+            info = await self._loop.getaddrinfo(target[0], target[1])
         except Exception as e:
             log.error("", exc_info=e)
+            return None, target
+
+        info = info[0]
+        sk2 = socket.socket(info[0], info[1], info[2])
+        sk2.setblocking(False)
+        try:
+            await self._loop.sock_connect(sk2, info[-1])
+            return sk2, target
+        except Exception as e:
+            log.error("", exc_info=e)
+            sk2.close()
+            return None, target
+
+
