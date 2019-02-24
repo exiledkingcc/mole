@@ -6,7 +6,8 @@ import socket
 
 from mole import crypto
 from mole import utils
-from mole.socks5 import Socks5Cmd, Socks5IpTYpe, Socks5State, host_name
+from mole.libsodium import LibSodium
+from mole.socks5 import Socks5Cmd, host_name
 
 log = logging.getLogger(__name__)
 
@@ -41,19 +42,6 @@ class MoleClient:
         except KeyboardInterrupt:
             self._socket.close()
 
-    def _decrypt(self, data):
-        PL = self._crypto.prefix_len
-        dlen = len(data)
-        if dlen <= PL + 4:
-            return 0, b""
-        xlen = int.from_bytes(data[:PL], "little")
-        if dlen < PL + xlen:
-            return 0, b""
-
-        dd = data[PL: PL + xlen]
-        dd = self._crypto.decrypt(dd)
-        return PL + xlen, dd
-
     async def serve(self):
         while True:
             sk, addr = await self._loop.sock_accept(self._socket)
@@ -72,12 +60,12 @@ class MoleClient:
         log.info("connect to %s:%s", target[0], target[1])
         sk2 = socket.socket(self._remote[0], self._remote[1], self._remote[2])
         try:
-            sk2, ok = await self._handle_connect(sk2, con_data)
+            sk2, cx = await self._handle_connect(sk2, con_data)
         except Exception as e:
             log.error("", exc_info=e)
-            ok = False
+            cx = None
 
-        if not ok:
+        if not cx:
             log.error("connecting %s:%s", target[0], target[1])
             await self._loop.sock_sendall(sk, b"\x05\x01\x00" + con_data)
             sk.close()
@@ -95,7 +83,7 @@ class MoleClient:
             try:
                 tx = sk.recv(N, socket.MSG_DONTWAIT)
                 if tx:
-                    tx = self._crypto.encrypt(tx)
+                    tx = cx.encrypt(tx)
                     tx_data.extend(tx)
             except BlockingIOError:
                 await asyncio.sleep(0.1)
@@ -124,7 +112,7 @@ class MoleClient:
                 break
 
             if rx_data:
-                dc, dd = self._decrypt(rx_data)
+                dc, dd = crypto.decrypt(cx, rx_data)
                 if dc > 0:
                     del rx_data[:dc]
                     dx_data.extend(dd)
@@ -189,7 +177,9 @@ class MoleClient:
         await self._loop.sock_sendall(sk2, data)
         rr = await self._loop.sock_recv(sk2, 1024)
         rr = self._crypto.decrypt(rr[self._crypto.prefix_len:])
-        return sk2, rr[0] == 0
+        key = rr[2:6]
+        nonce = rr[6: 10]
+        return sk2, crypto.MoleCrypto(key, nonce)
 
 
 class MoleServer:
@@ -216,19 +206,6 @@ class MoleServer:
         except KeyboardInterrupt:
             self._socket.close()
 
-    def _decrypt(self, data):
-        PL = self._crypto.prefix_len
-        dlen = len(data)
-        if dlen <= PL + 4:
-            return 0, b""
-        xlen = int.from_bytes(data[:PL], "little")
-        if dlen < PL + xlen:
-            return 0, b""
-
-        dd = data[PL: PL + xlen]
-        dd = self._crypto.decrypt(dd)
-        return PL + xlen, dd
-
     async def serve(self):
         while True:
             sk, addr = await self._loop.sock_accept(self._socket)
@@ -237,19 +214,24 @@ class MoleServer:
             self._loop.create_task(self.handle(sk))
 
     async def handle(self, sk: socket.socket):
+        # gen session key and nonce
+        key = LibSodium.randombytes(4)
+        nonce = LibSodium.randombytes(4)
+
         sk2, target = await self._handle_connect(sk)
         if not sk2:
             log.error("connecting %s:%s", target[0], target[1])
-            data = self._crypto.encrypt(b"\x01\x01")
+            data = self._crypto.encrypt(b"\x01\x01" + key + nonce)
             await self._loop.sock_sendall(sk, data)
             sk.close()
             return
 
         log.info("connected with %s:%s", target[0], target[1])
-        data = self._crypto.encrypt(b"\x00\x00")
+        data = self._crypto.encrypt(b"\x00\x00" + key + nonce)
         await self._loop.sock_sendall(sk, data)
 
-        N = 4096
+        cx = crypto.MoleCrypto(key, nonce)
+        N = 8192
         tx_data = bytearray()
         rx_data = bytearray()
         dx_data = bytearray()
@@ -268,7 +250,7 @@ class MoleServer:
                 break
 
             if tx_data:
-                dc, dd = self._decrypt(tx_data)
+                dc, dd = crypto.decrypt(cx, tx_data)
                 if dc > 0:
                     del tx_data[:dc]
                     dx_data.extend(dd)
@@ -280,7 +262,7 @@ class MoleServer:
             try:
                 rx = sk2.recv(N, socket.MSG_DONTWAIT)
                 if rx:
-                    rx = self._crypto.encrypt(rx)
+                    rx = cx.encrypt(rx)
                     rx_data.extend(rx)
             except BlockingIOError:
                 await asyncio.sleep(0.1)
