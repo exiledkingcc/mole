@@ -1,44 +1,14 @@
 # coding: utf-8
 
 import asyncio
-import enum
 import logging
 import socket
 
 from mole import crypto
 from mole import utils
+from mole.socks5 import Socks5Cmd, Socks5IpTYpe, Socks5State, host_name
 
 log = logging.getLogger(__name__)
-
-
-class Socks5Cmd(enum.IntEnum):
-    Connect = 1
-    Bind = 2
-    Udp = 3
-
-
-class Socks5IpTYpe(enum.IntEnum):
-    IPV4 = 1
-    Domain = 3
-    IPV6 = 4
-
-
-class Socks5State(enum.IntEnum):
-    Ver = 0
-    Auth = 1
-    Connect = 2
-    Stream = 3
-    Done = 4
-
-
-def host_name(addr: bytes, atype):
-    if atype == Socks5IpTYpe.IPV4.value:
-        return utils.host_v4(atype)
-    elif atype == Socks5IpTYpe.IPV6.value:
-        return utils.host_v6(addr)
-    elif atype == Socks5IpTYpe.Domain.value:
-        return addr[1:].decode("utf-8")
-    return None
 
 
 class MoleClient:
