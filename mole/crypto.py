@@ -34,17 +34,21 @@ class MoleCrypto(Crypto):
         if isinstance(nonce, str):
             nonce = nonce.encode("utf-8")
         key = hashlib.sha512(key).digest()
-        nonce = hashlib.sha512(nonce).digest()
         self._key = key[:self.keybytes]
-        self._nonce = nonce[:self.npubbytes]
+        self._nonce = nonce
 
     def encrypt(self, data: bytearray):
-        e = LibSodium.xchacha20poly1305_ietf_encrypt(bytes(data), self._nonce, self._key)
-        el = len(e).to_bytes(self.prefix_len, "little")
-        return el + e
+        nonce = LibSodium.randombytes(2)
+        nonce2 = hashlib.sha512(self._nonce + nonce).digest()[:self.npubbytes]
+        e = LibSodium.xchacha20poly1305_ietf_encrypt(bytes(data), nonce2, self._key)
+        el = (len(e) + 2).to_bytes(self.prefix_len, "little")
+        return el + nonce + e
 
     def decrypt(self, data: bytearray):
-        m = LibSodium.xchacha20poly1305_ietf_decrypt(bytes(data), self._nonce, self._key)
+        nonce = data[:2]
+        nonce2 = hashlib.sha512(self._nonce + nonce).digest()[:self.npubbytes]
+        cipher = bytes(data[2:])
+        m = LibSodium.xchacha20poly1305_ietf_decrypt(cipher, nonce2, self._key)
         return m
 
 
