@@ -8,18 +8,18 @@ from mole.libsodium import LibSodium
 class Crypto:
     prefix_len = 0
 
-    def encrypt(self, data: bytes):
+    def encrypt(self, data: bytearray):
         raise NotImplemented
 
-    def decrypt(self, data: bytes):
+    def decrypt(self, data: bytearray):
         raise NotImplemented
 
 
 class PlainCrypto(Crypto):
-    def encrypt(self, data: bytes):
+    def encrypt(self, data: bytearray):
         return data
 
-    def decrypt(self, data: bytes):
+    def decrypt(self, data: bytearray):
         return data
 
 

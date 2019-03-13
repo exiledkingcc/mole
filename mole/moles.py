@@ -342,5 +342,3 @@ class MoleServer:
             log.error("", exc_info=e)
             sk2.close()
             return None, target
-
-

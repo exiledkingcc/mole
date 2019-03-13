@@ -5,6 +5,7 @@ import argparse
 import logging
 import sys
 
+from mole import cclog
 from mole import crypto
 from mole.moles import MoleClient, MoleServer
 
@@ -20,6 +21,8 @@ def main(args=None):
     parser.add_argument("mode", help="run mode", choices=["client", "server", "proxy"])
     args = parser.parse_args(args=args)
 
+    cclog.init(level=logging.DEBUG if args.dev else logging.INFO)
+
     _crypto = crypto.MoleCrypto("hello", "world")
 
     if args.mode == "client":
@@ -33,13 +36,4 @@ def main(args=None):
 
 
 if __name__ == '__main__':
-    try:
-        import cclog
-        cclog.init()
-    except ImportError:
-        logging.basicConfig(
-            stream=sys.stderr,
-            level=logging.DEBUG,
-            format="%(asctime)s [%(levelname)s] [%(name)s] [%(threadName)s] [%(funcName)s]: %(message)s"
-        )
     sys.exit(main())

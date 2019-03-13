@@ -6,7 +6,6 @@ import enum
 import logging
 import socket
 import sys
-import traceback
 
 from mole import cclog
 from mole import utils
